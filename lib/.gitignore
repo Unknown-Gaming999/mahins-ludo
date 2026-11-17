@@ -1,0 +1,7 @@
+build/
+.dart_tool/
+android/
+functions/node_modules/
+hosting/public/MahinsLudo.apk
+*.iml
+.idea/
