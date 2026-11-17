@@ -1,0 +1,67 @@
+name: Split project bundle
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  split:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Split files
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from pathlib import PurePosixPath
+          import re
+
+          source = Path("lib/main.dart")
+          content = source.read_text(encoding="utf-8")
+
+          pattern = re.compile(
+              r"(?m)^===== FILE: (.+?) =====[ \t]*$"
+          )
+          matches = list(pattern.finditer(content))
+
+          if not matches:
+              raise SystemExit("Project file markers not found!")
+
+          for i, match in enumerate(matches):
+              name = PurePosixPath(match.group(1).strip())
+
+              if name.is_absolute() or ".." in name.parts:
+                  raise SystemExit("Invalid file path!")
+
+              end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+              body = content[match.end():end].lstrip("\r\n")
+
+              target = Path(*name.parts)
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_text(body.rstrip() + "\n", encoding="utf-8")
+              print("Created:", target)
+
+          build = Path(".github/workflows/build-apk.yml")
+          if build.exists():
+              data = build.read_text()
+              data = data.replace(
+                  "on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n",
+                  "on:\n  workflow_dispatch:\n"
+              )
+              build.write_text(data)
+
+          print("All project files separated!")
+          PY
+
+      - name: Save files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Split project files"
+            git push
+          fi
