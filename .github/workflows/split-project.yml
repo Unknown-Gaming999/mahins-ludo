@@ -1,67 +1,384 @@
-name: Split project bundle
+
+name: Split project files
 
 on:
   workflow_dispatch:
+    inputs:
+      source_file:
+        description: Combined project file
+        required: true
+        default: lib/main.dart
+        type: string
+      dry_run:
+        description: Test only, do not change repo files
+        required: true
+        default: true
+        type: boolean
+      overwrite_existing:
+        description: Overwrite existing files
+        required: true
+        default: false
+        type: boolean
+      require_all:
+        description: Fail if expected markers are missing
+        required: true
+        default: false
+        type: boolean
+      allow_extra:
+        description: Allow paths outside expected list
+        required: true
+        default: false
+        type: boolean
+      skip_syntax_checks:
+        description: Skip basic syntax checks
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
 
+concurrency:
+  group: split-project
+  cancel-in-progress: false
+
 jobs:
   split:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 10
 
-      - name: Split files
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PUSH_TOKEN || github.token }}
+
+      - name: Split and validate
+        id: split
+        env:
+          SRC: ${{ inputs.source_file }}
+          DRY: ${{ inputs.dry_run }}
+          OVERWRITE: ${{ inputs.overwrite_existing }}
+          REQUIRE_ALL: ${{ inputs.require_all }}
+          ALLOW_EXTRA: ${{ inputs.allow_extra }}
+          SKIP_CHECKS: ${{ inputs.skip_syntax_checks }}
+          HAS_PUSH_TOKEN: ${{ secrets.PUSH_TOKEN != '' }}
         run: |
           python3 - <<'PY'
-          from pathlib import Path
-          from pathlib import PurePosixPath
-          import re
+          import os, re, sys, json, shutil, pathlib
+          import subprocess, tempfile, base64
+          import xml.etree.ElementTree as ET
 
-          source = Path("lib/main.dart")
-          content = source.read_text(encoding="utf-8")
+          root = pathlib.Path.cwd().resolve()
+          out = pathlib.Path(os.environ["RUNNER_TEMP"]) / "split-out"
+          stage = out / "staging"
+          backup = out / "backup"
+          skipped = out / "skipped-workflows"
 
-          pattern = re.compile(
-              r"(?m)^===== FILE: (.+?) =====[ \t]*$"
+          for d in (stage, backup, skipped):
+              d.mkdir(parents=True, exist_ok=True)
+
+          errors = []
+
+          def flag(k, default=False):
+              v = os.getenv(k, "").strip().lower()
+              return default if not v else v == "true"
+
+          dry = flag("DRY", True)
+          overwrite = flag("OVERWRITE", False)
+          require_all = flag("REQUIRE_ALL", False)
+          allow_extra = flag("ALLOW_EXTRA", False)
+          skip_checks = flag("SKIP_CHECKS", False)
+          has_push_token = flag("HAS_PUSH_TOKEN", False)
+          src = (os.getenv("SRC") or "lib/main.dart").strip()
+
+          expected = """
+          .gitignore
+          pubspec.yaml
+          firebase.json
+          database.rules.json
+          .github/workflows/build-apk.yml
+          .github/workflows/deploy-backend.yml
+          android_overrides/app/src/main/AndroidManifest.xml
+          android_overrides/app/src/main/res/values/strings.xml
+          android_overrides/app/src/main/res/drawable/launch_background.xml
+          android_overrides/debug.keystore.b64
+          tools/patch_android.py
+          tools/make_icons.py
+          functions/package.json
+          functions/index.js
+          hosting/public/.well-known/assetlinks.json
+          hosting/public/index.html
+          hosting/public/join.html
+          lib/config.dart
+          lib/settings.dart
+          lib/deep_links.dart
+          lib/main.dart
+          lib/models.dart
+          lib/backend.dart
+          lib/ludo_layout.dart
+          lib/widgets/common.dart
+          lib/widgets/board_painter.dart
+          lib/widgets/dice_view.dart
+          lib/screens/splash_screen.dart
+          lib/screens/menu_screens.dart
+          lib/screens/lobby_screen.dart
+          lib/screens/game_screen.dart
+          lib/screens/profile_settings.dart
+          """.split()
+
+          def summary(lines):
+              p = os.getenv("GITHUB_STEP_SUMMARY")
+              with open(p, "a", encoding="utf-8") as f:
+                  f.write("\n".join(lines) + "\n")
+
+          def fail():
+              lines = [
+                  "## Split Failed",
+                  "",
+                  "No project files were applied because validation failed.",
+                  ""
+              ]
+              for e in errors[:20]:
+                  lines.append("- " + e)
+                  print("::error::" + e[:200])
+              summary(lines)
+              sys.exit(1)
+
+          def safe_path(raw):
+              p = raw.replace("\\", "/").strip()
+              if p.startswith("./"):
+                  p = p[2:]
+              if (not p or p.startswith("/") or
+                  re.match(r"^[A-Za-z]:", p) or
+                  any(x in ("", ".", "..") for x in p.split("/")) or
+                  p.split("/")[0] == ".git" or
+                  re.search(r"""[\s*?<>|"' :]""", p)):
+                  return None
+              return p
+
+          safe_src = safe_path(src)
+          if not safe_src:
+              errors.append("Invalid source_file path.")
+              fail()
+
+          source = (root / safe_src).resolve()
+          if root not in source.parents or not source.is_file():
+              errors.append("Source file not found: " + safe_src)
+              fail()
+
+          try:
+              content = source.read_text(encoding="utf-8-sig")
+          except Exception as e:
+              errors.append("Could not read source file: " + str(e))
+              fail()
+
+          content = content.replace("\r\n", "\n").replace("\r", "\n")
+
+          marker = re.compile(
+              r"^\s*={3,}\s*FILE:\s*(.+?)\s*={3,}\s*$"
           )
-          matches = list(pattern.finditer(content))
 
-          if not matches:
-              raise SystemExit("Project file markers not found!")
+          sections = []
+          current = None
 
-          for i, match in enumerate(matches):
-              name = PurePosixPath(match.group(1).strip())
+          for n, line in enumerate(content.split("\n"), 1):
+              m = marker.match(line)
+              if m:
+                  current = [m.group(1).strip(), [], n]
+                  sections.append(current)
+              elif current is not None:
+                  current[1].append(line)
 
-              if name.is_absolute() or ".." in name.parts:
-                  raise SystemExit("Invalid file path!")
+          if not sections:
+              errors.append("No FILE markers found in " + safe_src)
+              fail()
 
-              end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
-              body = content[match.end():end].lstrip("\r\n")
+          def clean(lines):
+              lines = list(lines)
+              while lines and not lines[0].strip():
+                  lines.pop(0)
+              while lines and not lines[-1].strip():
+                  lines.pop()
+              if lines and lines[0].strip().startswith("```"):
+                  lines.pop(0)
+              if lines and lines[-1].strip() == "```":
+                  lines.pop()
+              return "\n".join(lines).rstrip() + "\n" if lines else ""
 
-              target = Path(*name.parts)
+          files = {}
+
+          for raw, lines, line_no in sections:
+              p = safe_path(raw)
+              if not p:
+                  errors.append("Invalid marker path at line %d" % line_no)
+                  continue
+              if p in files:
+                  errors.append("Duplicate marker: " + p)
+                  continue
+              if p not in expected and not allow_extra:
+                  errors.append("Unexpected file marker: " + p)
+                  continue
+              files[p] = clean(lines)
+
+          missing = [p for p in expected if p not in files]
+          if missing and require_all:
+              errors.append("Missing markers: " + ", ".join(missing[:12]))
+
+          for p, data in files.items():
+              if not data.strip():
+                  errors.append(p + ": empty file")
+                  continue
+              if skip_checks:
+                  continue
+              ext = pathlib.Path(p).suffix.lower()
+              try:
+                  if ext == ".json":
+                      json.loads(data)
+                  elif ext == ".py":
+                      compile(data, p, "exec")
+                  elif ext == ".xml":
+                      ET.fromstring(data)
+                  elif ext == ".js" and shutil.which("node"):
+                      with tempfile.NamedTemporaryFile(
+                          "w", suffix=".js", delete=False, encoding="utf-8"
+                      ) as f:
+                          f.write(data)
+                          temp = f.name
+                      r = subprocess.run(
+                          ["node", "--check", temp],
+                          capture_output=True, text=True, timeout=30
+                      )
+                      os.unlink(temp)
+                      if r.returncode:
+                          errors.append(p + ": JavaScript syntax error")
+                  elif ext == ".b64":
+                      raw = base64.b64decode("".join(data.split()), validate=True)
+                      if len(raw) < 2000:
+                          errors.append(p + ": base64 file too short")
+              except Exception as e:
+                  errors.append(p + ": " + str(e)[:150])
+
+              target = root / p
+              if target.is_dir():
+                  errors.append(p + ": destination is a folder")
+              for parent in pathlib.PurePosixPath(p).parents:
+                  pp = root / str(parent)
+                  if str(parent) not in (".", "") and pp.exists() and not pp.is_dir():
+                      errors.append(p + ": parent path is a file")
+                      break
+
+          if errors:
+              fail()
+
+          for p, data in files.items():
+              target = stage / p
               target.parent.mkdir(parents=True, exist_ok=True)
-              target.write_text(body.rstrip() + "\n", encoding="utf-8")
-              print("Created:", target)
+              target.write_text(data, encoding="utf-8")
 
-          build = Path(".github/workflows/build-apk.yml")
-          if build.exists():
-              data = build.read_text()
-              data = data.replace(
-                  "on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n",
-                  "on:\n  workflow_dispatch:\n"
-              )
-              build.write_text(data)
+          created, updated, unchanged, kept, skipped_wf = [], [], [], [], []
 
-          print("All project files separated!")
+          for p, data in files.items():
+              target = root / p
+
+              if p.startswith(".github/workflows/") and not has_push_token:
+                  (skipped / p.replace("/", "__")).write_text(data, encoding="utf-8")
+                  skipped_wf.append(p)
+                  continue
+
+              old = None
+              if target.is_file():
+                  try:
+                      old = target.read_text(encoding="utf-8").replace("\r\n", "\n")
+                  except Exception:
+                      old = ""
+
+              if old == data:
+                  unchanged.append(p)
+                  continue
+
+              if old is not None and not overwrite:
+                  kept.append(p)
+                  continue
+
+              if old is None:
+                  created.append(p)
+              else:
+                  updated.append(p)
+                  b = backup / p
+                  b.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(target, b)
+
+              if not dry:
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_text(data, encoding="utf-8")
+
+          changed = [] if dry else created + updated
+          (out / "changed.txt").write_text(
+              "\n".join(changed) + ("\n" if changed else ""),
+              encoding="utf-8"
+          )
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("changed=" + ("true" if changed else "false") + "\n")
+
+          lines = [
+              "## Split " + ("Dry Run successful (no files changed)" if dry else "successful"),
+              "",
+              "| Result | Count |",
+              "|---|---:|",
+              "| Created | %d |" % len(created),
+              "| Updated | %d |" % len(updated),
+              "| Unchanged | %d |" % len(unchanged),
+              "| Kept | %d |" % len(kept),
+              "| Skipped workflow files | %d |" % len(skipped_wf),
+              ""
+          ]
+
+          if missing and not require_all:
+              lines += ["Missing markers (ignored): " + ", ".join(missing[:15]), ""]
+
+          if created:
+              lines += ["Created: " + ", ".join(created), ""]
+          if updated:
+              lines += ["Updated: " + ", ".join(updated), ""]
+          if kept:
+              lines += ["Kept existing files: " + ", ".join(kept), ""]
+          if skipped_wf:
+              lines += [
+                  "Workflow files skipped because PUSH_TOKEN is missing:",
+                  ", ".join(skipped_wf),
+                  ""
+              ]
+
+          summary(lines)
+          print("Split finished.")
           PY
 
-      - name: Save files
+      - name: Upload split result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: split-result
+          path: ${{ runner.temp }}/split-out
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Commit and push
+        if: steps.split.outputs.changed == 'true' && inputs.dry_run != true
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if ! git diff --cached --quiet; then
-            git commit -m "Split project files"
-            git push
+
+          xargs -a "$RUNNER_TEMP/split-out/changed.txt" -d '\n' git add -f --
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
           fi
+
+          git commit -m "Split project files"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+          echo "## Commit and push completed" >> "$GITHUB_STEP_SUMMARY"
