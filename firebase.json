@@ -1,25 +1,24 @@
 {
-  "database": {
-    "rules": "database.rules.json"
-  },
+  "database": { "rules": "database.rules.json" },
   "functions": [
-    {
-      "source": "functions",
-      "codebase": "default",
-      "ignore": [
-        "node_modules",
-        ".git",
-        "firebase-debug.log",
-        "*.local"
-      ]
-    }
+    { "source": "functions", "codebase": "default", "runtime": "nodejs20" }
   ],
   "hosting": {
     "public": "hosting/public",
-    "ignore": [
-      "firebase.json",
-      "**/.*",
-      "**/node_modules/**"
+    "ignore": ["firebase.json", "**/node_modules/**"],
+    "rewrites": [{ "source": "/join/**", "destination": "/join.html" }],
+    "headers": [
+      {
+        "source": "/.well-known/assetlinks.json",
+        "headers": [{ "key": "Content-Type", "value": "application/json" }]
+      },
+      {
+        "source": "**/*.apk",
+        "headers": [
+          { "key": "Content-Type", "value": "application/vnd.android.package-archive" },
+          { "key": "Content-Disposition", "value": "attachment; filename=\"MahinsLudo.apk\"" }
+        ]
+      }
     ]
   }
 }
