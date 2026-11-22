@@ -6,6 +6,10 @@ import '../widgets/common.dart';
 import 'game_screen.dart';
 import 'lobby_screen.dart';
 import 'profile_settings.dart';
+import 'package:flutter/material.dart';
+import '../backend.dart';
+import '../models.dart';
+import '../common.dart';
 
 void openRoom(BuildContext context, String code, String status, {bool replace = false}) {
   final route = MaterialPageRoute(
