@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import '../backend.dart';
 import '../models.dart';
 import '../common.dart';
+
 class ProfileScreen extends StatefulWidget {
   final bool firstRun;
   const ProfileScreen({super.key, this.firstRun = false});
