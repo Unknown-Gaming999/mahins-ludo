@@ -37,7 +37,9 @@ class Backend {
 
   static String get uid {
     final user = auth.currentUser;
-    if (user == null) throw BackendException('Please sign in first.');
+    if (user == null) {
+      throw BackendException('Please sign in first.');
+    }
     return user.uid;
   }
 
@@ -51,9 +53,11 @@ class Backend {
     if (value is! Map) return {};
     return value.map((k, v) => MapEntry(
           k.toString(),
-          v is Map ? _map(v) : v is List
-              ? v.map((e) => e is Map ? _map(e) : e).toList()
-              : v,
+          v is Map
+              ? _map(v)
+              : v is List
+                  ? v.map((e) => e is Map ? _map(e) : e).toList()
+                  : v,
         ));
   }
 
@@ -147,7 +151,7 @@ class Backend {
     String code,
     dynamic Function(Map<String, dynamic>, int) action,
   ) async {
-    Object? failure;
+    BackendException? failure;
     dynamic output;
 
     final ref = db.ref('rooms/$code');
@@ -167,14 +171,15 @@ class Backend {
         output = action(room, now());
         return Transaction.success(room);
       } catch (e) {
-        failure = e;
+        failure = e is BackendException
+            ? e
+            : BackendException(e.toString());
         return Transaction.abort();
       }
     }, applyLocally: false);
 
     if (failure != null) {
-      if (failure is BackendException) throw failure;
-      throw BackendException(failure.toString());
+      throw failure!;
     }
 
     if (!result.committed) {
@@ -420,7 +425,9 @@ class Backend {
 
   static List<int> _activeColors(Map<String, dynamic> room) {
     final game = _map(room['game']);
-    final order = (game['order'] as List? ?? []).map((e) => (e as num).toInt()).toList();
+    final order = (game['order'] as List? ?? [])
+        .map((e) => (e as num).toInt())
+        .toList();
     final players = _map(room['players']);
 
     return order.where((color) {
@@ -437,7 +444,9 @@ class Backend {
 
   static void _passTurn(Map<String, dynamic> room, int time) {
     final game = _map(room['game']);
-    final order = (game['order'] as List).map((e) => (e as num).toInt()).toList();
+    final order = (game['order'] as List)
+        .map((e) => (e as num).toInt())
+        .toList();
     final active = _activeColors(room);
 
     if (active.isEmpty) return;
@@ -586,7 +595,8 @@ class Backend {
         final pos = positions[i];
         if (pos == -1 && dice == 6) {
           movable.add(i);
-        } else if (pos >= 0 && pos < _finish &&
+        } else if (pos >= 0 &&
+            pos < _finish &&
             pos + dice <= _finish) {
           movable.add(i);
         }
@@ -627,7 +637,8 @@ class Backend {
 
       if (game['phase'] != 'move' ||
           !movable.contains(token) ||
-          token < 0 || token > 3) {
+          token < 0 ||
+          token > 3) {
         throw BackendException('Token cannot move.');
       }
 
